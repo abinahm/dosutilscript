@@ -1,0 +1,179 @@
+
+show_help() {
+  cat <<'HELP'
+Usage: dosutil COMMAND [parameters] (or dosutil for interactive mode)
+  os                         Show container OS version
+  type FILE                  Display file contents
+  copy SOURCE DEST           Copy file or directory; refuse overwrite
+  copy! SOURCE DEST          Copy and overwrite existing target
+  ren SOURCE DEST            Rename file or directory; refuse overwrite
+  ren! SOURCE DEST           Rename and overwrite existing target
+  move SOURCE DEST           Move file or directory; refuse overwrite
+  move! SOURCE DEST          Move and overwrite existing target
+  del PATH                   Delete a file or directory
+  chgrp GROUP PATH           Change group ownership
+  chmod MODE PATH            Change permissions (e.g. 644)
+  head FILE [LINES]          Display first lines (default 10)
+  tail FILE [LINES]          Display last lines (default 10)
+  help                       Show this help
+HELP
+}
+
+file_kind() {
+  local CHECK_PATH="$1"
+  if [[ -L "$CHECK_PATH" ]]; then FILE_KIND="symbolic link"
+  elif [[ -f "$CHECK_PATH" ]]; then FILE_KIND="regular file"
+  elif [[ -d "$CHECK_PATH" ]]; then FILE_KIND="directory"
+  elif [[ -e "$CHECK_PATH" ]]; then FILE_KIND="other filesystem object"
+  else FILE_KIND="missing"; fi
+}
+
+run_file_command() {
+  local STATUS=0 TARGET="$DESTINATION" FORCE=0
+  local -a UNIX_COMMAND=()
+  file_kind "$SOURCE"
+  printf 'Source: %s (%s)\n' "$SOURCE" "$FILE_KIND"
+  if [[ "$FILE_KIND" == missing ]]; then
+    printf 'Error: source does not exist: %s\n' "$SOURCE" >&2; return 1
+  fi
+  if [[ "$SOURCE" == "$DESTINATION" ]]; then
+    printf 'Error: source and destination are identical.\n' >&2; return 1
+  fi
+  if [[ -d "$DESTINATION" ]]; then
+    TARGET="${DESTINATION%/}/$(basename -- "$SOURCE")"
+  fi
+  file_kind "$TARGET"
+  printf 'Target: %s (%s)\n' "$TARGET" "$FILE_KIND"
+  if [[ "$COMMAND" == *'!' ]]; then FORCE=1; fi
+  if [[ "$FORCE" -eq 0 && "$FILE_KIND" != missing ]]; then
+    printf 'Error: target exists; use %s! to overwrite.\n' "${COMMAND%!}" >&2; return 1
+  fi
+  case "$COMMAND" in
+    copy|copy!) UNIX_COMMAND=(cp -R);;
+    ren|ren!|move|move!) UNIX_COMMAND=(mv);;
+  esac
+  # -T treats destination as the exact target, including when it is a directory.
+  # -f overwrites without prompting; -n prevents overwriting in normal mode.
+  if [[ "$FORCE" -eq 1 ]]; then
+    UNIX_COMMAND+=(-fT)
+  else
+    UNIX_COMMAND+=(-nT)
+  fi
+  UNIX_COMMAND+=(-- "$SOURCE" "$TARGET")
+  printf '\nUNIX command ran: '
+  printf '%q ' "${UNIX_COMMAND[@]}"
+  printf '\n\n'
+  "${UNIX_COMMAND[@]}" >/dev/null 2>&1
+  STATUS=$?
+  if [[ "$STATUS" -eq 0 ]]; then
+    printf 'Success: %s completed.\n' "$COMMAND"
+  else
+    printf 'Failed: %s (exit status %s).\n' "$COMMAND" "$STATUS" >&2
+  fi
+  return "$STATUS"
+}
+
+run_delete() {
+  local STATUS
+  file_kind "$SOURCE"
+  printf 'Source: %s (%s)\n' "$SOURCE" "$FILE_KIND"
+  if [[ "$FILE_KIND" == missing ]]; then
+    printf 'Error: path does not exist.\n' >&2; return 1
+  fi
+  printf '\nUNIX command ran: rm -r -- %q\n\n' "$SOURCE"
+  rm -r -- "$SOURCE" >/dev/null 2>&1
+  STATUS=$?
+  if [[ "$STATUS" -eq 0 ]]; then echo 'Success: del completed.'
+  else echo 'Failed: del.' >&2; fi
+  return "$STATUS"
+}
+
+execute_command() {
+  COMMAND="${1,,}"  # Normalize command case in one operation.
+  SOURCE="${2:-}"
+  DESTINATION="${3:-}"
+  case "$COMMAND" in
+    os) cat /etc/os-release;;
+    type)
+      [[ -n "$SOURCE" && -f "$SOURCE" ]] || { echo 'Error: type requires an existing regular file.' >&2; return 1; }
+      cat -- "$SOURCE";;
+    copy|copy!|ren|ren!|move|move!)
+      [[ -n "$SOURCE" && -n "$DESTINATION" ]] || { echo 'Error: SOURCE and DEST are required.' >&2; return 1; }
+      run_file_command;;
+    del)
+      [[ -n "$SOURCE" ]] || { echo 'Error: PATH is required.' >&2; return 1; }
+      run_delete;;
+    chgrp|chmod)
+      [[ -n "$SOURCE" && -n "$DESTINATION" ]] || { echo 'Error: VALUE and PATH are required.' >&2; return 1; }
+      file_kind "$DESTINATION"
+      [[ "$FILE_KIND" != missing ]] || { echo 'Error: path does not exist.' >&2; return 1; }
+      if [[ "$COMMAND" == chmod ]]; then
+        [[ "$SOURCE" =~ ^[0-7]{3,4}$ ]] || { echo 'Error: MODE must be octal, e.g. 644.' >&2; return 1; }
+      fi
+      printf '\nUNIX command ran: %q %q %q\n\n' "$COMMAND" "$SOURCE" "$DESTINATION"
+      if "$COMMAND" -- "$SOURCE" "$DESTINATION" >/dev/null 2>&1; then
+        echo "Success: $COMMAND completed."
+      else echo "Failed: $COMMAND." >&2; return 1; fi;;
+    head|tail)
+      [[ -n "$SOURCE" && -f "$SOURCE" ]] || { echo 'Error: existing file required.' >&2; return 1; }
+      LINE_COUNT="${3:-10}"
+      [[ "$LINE_COUNT" =~ ^[0-9]+$ ]] || { echo 'Error: LINES must be a nonnegative integer.' >&2; return 1; }
+      printf '\nUNIX command ran: %s -n %q %q\n\n' "$COMMAND" "$LINE_COUNT" "$SOURCE"
+      "$COMMAND" -n "$LINE_COUNT" -- "$SOURCE";;
+    help|*) show_help;;
+  esac
+}
+
+interactive_mode() {
+  local SORT_MODE SELECTION REPLY_VALUE ITEM
+  local -a FILES=()
+  while true; do
+    echo 'Sort file list:'
+    select SORT_MODE in 'Name' 'Age (newest first)' 'Size (largest first)' 'Quit'; do
+      [[ -n "$SORT_MODE" ]] && break
+      echo 'Invalid selection.'
+    done
+    [[ "$SORT_MODE" == Quit ]] && return 0
+    
+    # Read current directory listing into array using command substitution.
+    case "$SORT_MODE" in
+      Name)
+        mapfile -t FILES < <(ls -1A) ;;
+      'Age (newest first)')
+        mapfile -t FILES < <(ls -1At) ;;
+      'Size (largest first)')
+        mapfile -t FILES < <(ls -1AS) ;;
+    esac
+    
+    [[ ${#FILES[@]} -gt 0 && -n "${FILES[0]}" ]] || { echo 'Directory is empty.'; continue; }
+    echo 'Choose a file/directory:'
+    select ITEM in "${FILES[@]}" 'Back'; do
+      [[ -n "$ITEM" ]] && break
+      echo 'Invalid selection.'
+    done
+    [[ "$ITEM" == Back ]] && continue
+    echo 'Choose a command:'
+    select SELECTION in type copy ren del move help 'copy!' 'move!' 'ren!' chgrp chmod head tail Back; do
+      [[ -n "$SELECTION" ]] && break
+      echo 'Invalid selection.'
+    done
+    [[ "$SELECTION" == Back ]] && continue
+    case "$SELECTION" in
+      copy|ren|move|'copy!'|'ren!'|'move!')
+        read -r -p 'Destination path: ' REPLY_VALUE
+        execute_command "$SELECTION" "$ITEM" "$REPLY_VALUE";;
+      chgrp) read -r -p 'New group: ' REPLY_VALUE
+        execute_command chgrp "$REPLY_VALUE" "$ITEM";;
+      chmod) read -r -p 'New octal permissions (e.g. 644): ' REPLY_VALUE
+        execute_command chmod "$REPLY_VALUE" "$ITEM";;
+      head|tail) read -r -p 'Number of lines (default 10): ' REPLY_VALUE
+        execute_command "$SELECTION" "$ITEM" "${REPLY_VALUE:-10}";;
+      help) execute_command help;;
+      *) execute_command "$SELECTION" "$ITEM";;
+    esac
+    printf '\n'
+  done
+}
+
+if [[ $# -eq 0 ]]; then interactive_mode
+else execute_command "$@"; fi
